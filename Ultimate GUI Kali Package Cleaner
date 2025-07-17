@@ -1,0 +1,63 @@
+#!/bin/bash
+
+# ── GUI Kali Cleaner v2 by my7bropx ──
+# Requirements: whiptail installed
+
+# Check for whiptail
+if ! command -v whiptail >/dev/null 2>&1; then
+    echo "❌ whiptail not found! Installing..."
+    sudo apt install -y whiptail
+fi
+
+# Step 1: Get user-installed packages only
+echo "📦 Collecting user-installed packages..."
+comm -23 \
+  <(apt-mark showmanual | sort) \
+  <(grep -vE '^#|^$' /usr/share/tasksel/packages/*.desc 2>/dev/null | sort) \
+  > /tmp/user_installed.txt
+
+# Step 2: Build size list
+> /tmp/user_pkg_sizes.txt
+while read pkg; do
+    size=$(dpkg-query -Wf='${Installed-Size}' "$pkg" 2>/dev/null)
+    if [[ ! -z "$size" ]]; then
+        echo -e "$size\t$pkg" >> /tmp/user_pkg_sizes.txt
+    fi
+done < /tmp/user_installed.txt
+
+# Sort by size and take top 30
+pkg_list=$(awk '{printf "%.1f MB\t%s\n", $1/1024, $2}' /tmp/user_pkg_sizes.txt | sort -nr | head -30)
+
+# Format for whiptail checklist
+menu=""
+while read -r line; do
+    size=$(echo "$line" | cut -f1)
+    name=$(echo "$line" | cut -f2)
+    menu+=" $name \"$size\" OFF"
+done <<< "$pkg_list"
+
+# Step 3: Show menu
+choices=$(whiptail --title "🔥 Kali GUI Package Cleaner" \
+  --checklist "Select packages to purge (SPACE = toggle, ENTER = confirm):" 25 80 20 \
+  $menu 3>&1 1>&2 2>&3)
+
+# Step 4: Purge selected packages
+if [[ -z "$choices" ]]; then
+    echo "❌ No packages selected. Exiting."
+    exit 1
+fi
+
+# Remove quotes
+choices=$(echo "$choices" | sed 's/"//g')
+
+# Confirm purge
+whiptail --yesno "You selected:\n$choices\n\nAre you sure you want to purge them?" 15 60
+if [[ $? -eq 0 ]]; then
+    echo -e "\n🗑️ Purging selected packages...\n"
+    sudo apt purge -y $choices
+    sudo apt autoremove -y
+    sudo apt clean
+    whiptail --msgbox "✅ Packages purged and system cleaned!" 10 50
+else
+    echo "❌ Cancelled purge."
+fi
