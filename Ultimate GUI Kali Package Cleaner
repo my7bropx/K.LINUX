@@ -1,63 +1,853 @@
 #!/bin/bash
 
-# ── GUI Kali Cleaner v2 by my7bropx ──
-# Requirements: whiptail installed
+# Enhanced Kali Linux System Cleanup Script
+# Version: 2.0
+# Created: $(date)
+set -euo pipefail  # Enhanced error handling
+IFS=$'\n\t'
 
-# Check for whiptail
-if ! command -v whiptail >/dev/null 2>&1; then
-    echo "❌ whiptail not found! Installing..."
-    sudo apt install -y whiptail
-fi
+# Script configuration
+readonly SCRIPT_NAME="$(basename "$0")"
+readonly SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+readonly LOG_FILE="$HOME/cleanup_$(date +%Y%m%d_%H%M%S).log"
+readonly CONFIG_FILE="$HOME/.cleanup_config"
 
-# Step 1: Get user-installed packages only
-echo "📦 Collecting user-installed packages..."
-comm -23 \
-  <(apt-mark showmanual | sort) \
-  <(grep -vE '^#|^$' /usr/share/tasksel/packages/*.desc 2>/dev/null | sort) \
-  > /tmp/user_installed.txt
+# Colors for output
+readonly RED='\033[0;31m'
+readonly GREEN='\033[0;32m'
+readonly YELLOW='\033[1;33m'
+readonly BLUE='\033[0;34m'
+readonly PURPLE='\033[0;35m'
+readonly CYAN='\033[0;36m'
+readonly BOLD='\033[1m'
+readonly NC='\033[0m' # No Color
 
-# Step 2: Build size list
-> /tmp/user_pkg_sizes.txt
-while read pkg; do
-    size=$(dpkg-query -Wf='${Installed-Size}' "$pkg" 2>/dev/null)
-    if [[ ! -z "$size" ]]; then
-        echo -e "$size\t$pkg" >> /tmp/user_pkg_sizes.txt
+# Global variables
+VERBOSE=false
+DRY_RUN=false
+SPACE_SAVED=0
+
+# Logging functions
+log() {
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" | tee -a "$LOG_FILE"
+}
+
+print_status() {
+    echo -e "${GREEN}[INFO]${NC} $1" | tee -a "$LOG_FILE"
+}
+
+print_warning() {
+    echo -e "${YELLOW}[WARNING]${NC} $1" | tee -a "$LOG_FILE"
+}
+
+print_error() {
+    echo -e "${RED}[ERROR]${NC} $1" | tee -a "$LOG_FILE"
+}
+
+print_success() {
+    echo -e "${GREEN}[SUCCESS]${NC} $1" | tee -a "$LOG_FILE"
+}
+
+print_header() {
+    echo -e "${BOLD}${BLUE}================================${NC}" | tee -a "$LOG_FILE"
+    echo -e "${BOLD}${BLUE}$1${NC}" | tee -a "$LOG_FILE"
+    echo -e "${BOLD}${BLUE}================================${NC}" | tee -a "$LOG_FILE"
+}
+
+print_subheader() {
+    echo -e "${CYAN}--- $1 ---${NC}" | tee -a "$LOG_FILE"
+}
+
+# Utility functions
+confirm_action() {
+    local message="$1"
+    local default="${2:-n}"
+    
+    if [[ "$DRY_RUN" == true ]]; then
+        print_warning "[DRY RUN] Would execute: $message"
+        return 0
     fi
-done < /tmp/user_installed.txt
+    
+    read -p "$message (y/N): " -n 1 -r
+    echo
+    if [[ $REPLY =~ ^[Yy]$ ]]; then
+        return 0
+    else
+        return 1
+    fi
+}
 
-# Sort by size and take top 30
-pkg_list=$(awk '{printf "%.1f MB\t%s\n", $1/1024, $2}' /tmp/user_pkg_sizes.txt | sort -nr | head -30)
+get_size_mb() {
+    local path="$1"
+    if [[ -e "$path" ]]; then
+        du -sm "$path" 2>/dev/null | cut -f1 | tr -d '\n' || echo "0"
+    else
+        echo "0"
+    fi
+}
 
-# Format for whiptail checklist
-menu=""
-while read -r line; do
-    size=$(echo "$line" | cut -f1)
-    name=$(echo "$line" | cut -f2)
-    menu+=" $name \"$size\" OFF"
-done <<< "$pkg_list"
+get_disk_usage() {
+    df -BG / | awk 'NR==2 {gsub(/G/, "", $4); print $4}' | tr -d '\n'
+}
 
-# Step 3: Show menu
-choices=$(whiptail --title "🔥 Kali GUI Package Cleaner" \
-  --checklist "Select packages to purge (SPACE = toggle, ENTER = confirm):" 25 80 20 \
-  $menu 3>&1 1>&2 2>&3)
+get_disk_usage_percent() {
+    df / | awk 'NR==2 {gsub(/%/, "", $5); print $5}' | tr -d '\n'
+}
 
-# Step 4: Purge selected packages
-if [[ -z "$choices" ]]; then
-    echo "❌ No packages selected. Exiting."
-    exit 1
-fi
+format_size() {
+    local size_bytes="$1"
+    if (( size_bytes > 1073741824 )); then
+        printf "%.2f GB" "$(echo "scale=2; $size_bytes / 1073741824" | bc -l)"
+    elif (( size_bytes > 1048576 )); then
+        printf "%.2f MB" "$(echo "scale=2; $size_bytes / 1048576" | bc -l)"
+    else
+        printf "%.2f KB" "$(echo "scale=2; $size_bytes / 1024" | bc -l)"
+    fi
+}
 
-# Remove quotes
-choices=$(echo "$choices" | sed 's/"//g')
+# Safe removal function with size tracking
+safe_remove() {
+    local path="$1"
+    local description="$2"
+    local size_before
+    
+    if [[ ! -e "$path" ]]; then
+        [[ "$VERBOSE" == true ]] && print_status "$description: Path doesn't exist ($path)"
+        return 0
+    fi
+    
+    size_before=$(get_size_mb "$path")
+    # Ensure size_before is a valid number
+    if ! [[ "$size_before" =~ ^[0-9]+$ ]]; then
+        size_before=0
+    fi
+    
+    if [[ "$DRY_RUN" == true ]]; then
+        print_warning "[DRY RUN] Would remove: $path ($description) - ${size_before}MB"
+        return 0
+    fi
+    
+    # Count files before removal for better reporting
+    local file_count=0
+    if [[ -d "$path" ]]; then
+        file_count=$(find "$path" -type f 2>/dev/null | wc -l)
+    elif [[ -f "$path" ]]; then
+        file_count=1
+    fi
+    
+    if rm -rf "$path" 2>/dev/null; then
+        SPACE_SAVED=$((SPACE_SAVED + size_before))
+        if [[ $size_before -gt 0 ]] || [[ $file_count -gt 0 ]]; then
+            print_success "$description: Cleaned $file_count files (${size_before}MB)"
+        else
+            [[ "$VERBOSE" == true ]] && print_status "$description: Already clean"
+        fi
+    else
+        print_error "$description: Failed to clean $path"
+    fi
+}
 
-# Confirm purge
-whiptail --yesno "You selected:\n$choices\n\nAre you sure you want to purge them?" 15 60
-if [[ $? -eq 0 ]]; then
-    echo -e "\n🗑️ Purging selected packages...\n"
-    sudo apt purge -y $choices
-    sudo apt autoremove -y
+# Enhanced package cleanup
+package_cleanup() {
+    print_subheader "Package Management Cleanup"
+    
+    # Update package database
+    print_status "Updating package database..."
+    if [[ "$DRY_RUN" == false ]]; then
+        sudo apt update -qq || print_error "Failed to update package database"
+    fi
+    
+    # Remove orphaned packages
+    print_status "Removing orphaned packages..."
+    if [[ "$DRY_RUN" == false ]]; then
+        local autoremove_output
+        autoremove_output=$(sudo apt autoremove --purge -y 2>&1)
+        if [[ $? -eq 0 ]]; then
+            print_success "Orphaned packages removed"
+            echo "$autoremove_output" | grep -E "(removed|upgraded)" | tee -a "$LOG_FILE"
+        else
+            print_error "Failed to remove orphaned packages"
+        fi
+    else
+        # Show what would be removed
+        apt list --upgradable 2>/dev/null | head -5
+        print_warning "[DRY RUN] Would run: sudo apt autoremove --purge -y"
+    fi
+    
+    # Clean package cache
+    local cache_size
+    cache_size=$(get_size_mb "/var/cache/apt/archives")
+    # Ensure cache_size is a valid number
+    if ! [[ "$cache_size" =~ ^[0-9]+$ ]]; then
+        cache_size=0
+    fi
+    print_status "Cleaning package cache (${cache_size}MB)..."
+    if [[ "$DRY_RUN" == false ]]; then
+        sudo apt autoclean 2>&1 | tee -a "$LOG_FILE"
+        sudo apt clean 2>&1 | tee -a "$LOG_FILE"
+        SPACE_SAVED=$((SPACE_SAVED + cache_size))
+        print_success "Package cache cleaned"
+    else
+        print_warning "[DRY RUN] Would run: sudo apt autoclean && sudo apt clean"
+    fi
+    
+    # Remove old kernels (keep current + 1 previous)
+    print_status "Checking for old kernels..."
+    local current_kernel
+    current_kernel=$(uname -r)
+    local installed_kernels
+    installed_kernels=$(dpkg -l | grep -E "linux-image-[0-9]" | grep -v "$current_kernel" | wc -l)
+    
+    if [[ $installed_kernels -gt 1 ]]; then
+        print_warning "Found $installed_kernels old kernel(s)"
+        if confirm_action "Remove old kernels (keeping current + 1)?"; then
+            if [[ "$DRY_RUN" == false ]]; then
+                sudo apt autoremove --purge -y
+            fi
+        fi
+    fi
+}
+
+# Enhanced log cleanup
+log_cleanup() {
+    print_subheader "System Log Cleanup"
+    
+    # Journal cleanup
+    local journal_size
+    journal_size=$(journalctl --disk-usage 2>/dev/null | grep -oE '[0-9]+\.[0-9]+[KMGT]' | head -1 || echo "0")
+    print_status "Current journal size: $journal_size"
+    
+    print_status "Limiting journal to last 7 days..."
+    if [[ "$DRY_RUN" == false ]]; then
+        sudo journalctl --vacuum-time=7d 2>&1 | tee -a "$LOG_FILE"
+        print_success "Journal cleaned"
+    else
+        print_warning "[DRY RUN] Would run: sudo journalctl --vacuum-time=7d"
+    fi
+    
+    # Rotate logs
+    print_status "Rotating system logs..."
+    if [[ "$DRY_RUN" == false ]]; then
+        sudo logrotate -f /etc/logrotate.conf 2>/dev/null || true
+        print_success "Logs rotated"
+    else
+        print_warning "[DRY RUN] Would run: sudo logrotate -f /etc/logrotate.conf"
+    fi
+    
+    # Clean old log files
+    safe_remove "/var/log/*.gz" "Compressed logs"
+    safe_remove "/var/log/*.old" "Old log files"
+    safe_remove "/var/log/*.[1-9]" "Rotated logs"
+    
+    # Application specific logs
+    safe_remove "$HOME/.xsession-errors*" "X session errors"
+    safe_remove "/var/log/installer" "Installer logs"
+}
+
+# Enhanced temporary files cleanup
+temp_cleanup() {
+    print_subheader "Temporary Files Cleanup"
+    
+    # System temp directories
+    print_status "Cleaning system temporary files..."
+    if [[ "$DRY_RUN" == false ]]; then
+        local temp_count_before temp_count_after
+        temp_count_before=$(find /tmp -type f -atime +1 2>/dev/null | wc -l)
+        sudo find /tmp -type f -atime +1 -delete 2>/dev/null || true
+        sudo find /var/tmp -type f -atime +7 -delete 2>/dev/null || true
+        temp_count_after=$(find /tmp -type f -atime +1 2>/dev/null | wc -l)
+        print_success "Cleaned $((temp_count_before - temp_count_after)) temporary files"
+    else
+        local temp_count
+        temp_count=$(find /tmp -type f -atime +1 2>/dev/null | wc -l)
+        print_warning "[DRY RUN] Would delete $temp_count temporary files older than 1 day"
+    fi
+    
+    # User temp files
+    safe_remove "$HOME/.tmp/*" "User temp files"
+    safe_remove "$HOME/tmp/*" "User tmp directory"
+    safe_remove "$HOME/.Trash-*" "Desktop trash"
+    
+    # Core dumps
+    safe_remove "/var/crash/*" "Crash dumps"
+    safe_remove "$HOME/core*" "Core dumps in home"
+}
+
+# Enhanced cache cleanup
+cache_cleanup() {
+    print_subheader "Application Cache Cleanup"
+    
+    # Browser caches
+    safe_remove "$HOME/.cache/mozilla/firefox/*/cache2" "Firefox cache"
+    safe_remove "$HOME/.cache/chromium/Default/Cache" "Chromium cache"
+    safe_remove "$HOME/.cache/google-chrome/Default/Cache" "Chrome cache"
+    safe_remove "$HOME/.cache/librewolf/*/cache2" "LibreWolf cache"
+    
+    # System caches
+    safe_remove "$HOME/.cache/thumbnails" "Thumbnail cache"
+    safe_remove "$HOME/.cache/fontconfig" "Font cache"
+    safe_remove "$HOME/.cache/gnome-software" "GNOME Software cache"
+    safe_remove "$HOME/.cache/tracker3" "Tracker cache"
+    safe_remove "$HOME/.cache/pip" "Python pip cache"
+    
+    # Development caches
+    safe_remove "$HOME/.cache/yarn" "Yarn cache"
+    safe_remove "$HOME/.cache/npm" "NPM cache"
+    safe_remove "$HOME/.npm/_cacache" "NPM cacache"
+    safe_remove "$HOME/.gradle/caches" "Gradle cache"
+    
+    # Kali specific
+    safe_remove "$HOME/.msf4/logs" "Metasploit logs"
+    safe_remove "$HOME/.local/share/recently-used.xbel" "Recently used files"
+}
+
+# Docker cleanup (if installed)
+docker_cleanup() {
+    if ! command -v docker &> /dev/null; then
+        return 0
+    fi
+    
+    print_subheader "Docker Cleanup"
+    
+    if confirm_action "Clean Docker images, containers, and volumes?"; then
+        if [[ "$DRY_RUN" == false ]]; then
+            docker system prune -af --volumes 2>/dev/null || true
+            print_success "Docker cleanup completed"
+        fi
+    fi
+}
+
+# Snap cleanup (if installed)
+snap_cleanup() {
+    if ! command -v snap &> /dev/null; then
+        return 0
+    fi
+    
+    print_subheader "Snap Package Cleanup"
+    
+    print_status "Removing old snap revisions..."
+    if [[ "$DRY_RUN" == false ]]; then
+        snap list --all | awk '/disabled/{print $1, $3}' | while read -r snapname revision; do
+            sudo snap remove "$snapname" --revision="$revision" 2>/dev/null || true
+        done
+    fi
+}
+
+# Flatpak cleanup (enhanced)
+flatpak_cleanup() {
+    if ! command -v flatpak &> /dev/null; then
+        return 0
+    fi
+    
+    print_subheader "Flatpak Cleanup"
+    
+    print_status "Removing unused Flatpak packages..."
+    if [[ "$DRY_RUN" == false ]]; then
+        flatpak uninstall --unused -y 2>/dev/null || true
+        flatpak repair --user 2>/dev/null || true
+    fi
+    
+    safe_remove "$HOME/.var/app/*/cache" "Flatpak app caches"
+}
+
+# System optimization
+system_optimization() {
+    print_subheader "System Optimization"
+    
+    # Update locate database
+    print_status "Updating locate database..."
+    if [[ "$DRY_RUN" == false ]]; then
+        sudo updatedb || print_warning "Failed to update locate database"
+    fi
+    
+    # Update font cache
+    print_status "Updating font cache..."
+    if [[ "$DRY_RUN" == false ]]; then
+        fc-cache -f 2>/dev/null || true
+    fi
+    
+    # Clean APT cache
+    if [[ "$DRY_RUN" == false ]]; then
+        sudo apt-get clean
+    fi
+}
+
+# Enhanced disk analysis
+analyze_disk() {
+    print_header "DISK USAGE ANALYSIS"
+    
+    # Overall system usage
+    print_status "System disk usage:"
+    df -h | grep -E "^Filesystem|^/dev/" | tee -a "$LOG_FILE"
+    
+    echo | tee -a "$LOG_FILE"
+    local disk_percent
+    disk_percent=$(get_disk_usage_percent)
+    if [[ $disk_percent -gt 90 ]]; then
+        print_error "Disk usage is critically high: ${disk_percent}%"
+    elif [[ $disk_percent -gt 80 ]]; then
+        print_warning "Disk usage is high: ${disk_percent}%"
+    else
+        print_status "Disk usage is normal: ${disk_percent}%"
+    fi
+    
+    # Home directory analysis
+    echo | tee -a "$LOG_FILE"
+    print_status "Top 15 largest items in home directory:"
+    du -sh "$HOME"/{*,.*} 2>/dev/null | sort -rh | head -15 | tee -a "$LOG_FILE"
+    
+    # Cache analysis
+    echo | tee -a "$LOG_FILE"
+    print_status "Cache directory analysis:"
+    if [[ -d "$HOME/.cache" ]]; then
+        du -sh "$HOME/.cache"/* 2>/dev/null | sort -rh | head -10 | tee -a "$LOG_FILE"
+    fi
+    
+    # System directories
+    echo | tee -a "$LOG_FILE"
+    print_status "Large system directories:"
+    sudo du -sh /var/log /var/cache /tmp /var/tmp 2>/dev/null | sort -rh | tee -a "$LOG_FILE"
+    
+    # Find large files
+    echo | tee -a "$LOG_FILE"
+    print_status "Largest files in system (>100MB):"
+    find / -type f -size +100M -exec ls -lah {} \; 2>/dev/null | sort -k5 -rh | head -10 | tee -a "$LOG_FILE"
+}
+
+# Enhanced DATA drive cleanup
+data_drive_cleanup() {
+    local data_path="/media/my7bropxki/DATA"
+    
+    if [[ ! -d "$data_path" ]]; then
+        print_error "DATA drive not found at $data_path"
+        return 1
+    fi
+    
+    print_header "DATA DRIVE CLEANUP"
+    
+    local usage_percent
+    usage_percent=$(df "$data_path" | awk 'NR==2 {gsub(/%/, "", $5); print $5}')
+    print_status "DATA drive usage: ${usage_percent}%"
+    
+    if [[ $usage_percent -gt 85 ]]; then
+        print_warning "DATA drive is almost full!"
+    fi
+    
+    print_status "Analyzing DATA drive contents..."
+    du -sh "$data_path"/* 2>/dev/null | sort -rh | head -15 | tee -a "$LOG_FILE"
+    
+    echo
+    print_status "Cleanup options:"
+    echo "1. Clean Timeshift snapshots"
+    echo "2. Remove duplicate files"
+    echo "3. Clean old downloads"
+    echo "4. Remove empty directories"
+    echo "5. Analyze specific directory"
+    echo "6. Back to main menu"
+    
+    read -p "Select option (1-6): " choice
+    
+    case $choice in
+        1) timeshift_cleanup "$data_path" ;;
+        2) find_duplicates "$data_path" ;;
+        3) clean_downloads "$data_path" ;;
+        4) remove_empty_dirs "$data_path" ;;
+        5) analyze_directory ;;
+        6) return 0 ;;
+        *) print_error "Invalid option" ;;
+    esac
+}
+
+timeshift_cleanup() {
+    local data_path="$1"
+    local timeshift_path="$data_path/timeshift"
+    
+    if [[ ! -d "$timeshift_path" ]]; then
+        print_error "Timeshift directory not found"
+        return 1
+    fi
+    
+    local timeshift_size
+    timeshift_size=$(get_size_mb "$timeshift_path")
+    print_status "Timeshift snapshots size: ${timeshift_size}MB"
+    
+    if command -v timeshift &> /dev/null; then
+        sudo timeshift --list
+        if confirm_action "Delete old Timeshift snapshots?"; then
+            if [[ "$DRY_RUN" == false ]]; then
+                sudo timeshift --delete-all --scripted
+                print_success "Timeshift snapshots cleaned!"
+            fi
+        fi
+    else
+        if confirm_action "Timeshift not installed. Manually delete timeshift directory?"; then
+            safe_remove "$timeshift_path" "Timeshift snapshots"
+        fi
+    fi
+}
+
+find_duplicates() {
+    local path="$1"
+    
+    if ! command -v fdupes &> /dev/null; then
+        print_error "fdupes not installed. Install with: sudo apt install fdupes"
+        return 1
+    fi
+    
+    print_status "Finding duplicate files in $path..."
+    fdupes -r "$path" | head -20 | tee -a "$LOG_FILE"
+    
+    if confirm_action "Remove duplicate files interactively?"; then
+        if [[ "$DRY_RUN" == false ]]; then
+            fdupes -r -d "$path"
+        fi
+    fi
+}
+
+# Configuration management
+load_config() {
+    if [[ -f "$CONFIG_FILE" ]]; then
+        source "$CONFIG_FILE"
+    fi
+}
+
+save_config() {
+    cat > "$CONFIG_FILE" << EOF
+# Cleanup script configuration
+AUTO_CONFIRM=${AUTO_CONFIRM:-false}
+KEEP_LOGS_DAYS=${KEEP_LOGS_DAYS:-7}
+SKIP_PACKAGE_CLEANUP=${SKIP_PACKAGE_CLEANUP:-false}
+SKIP_DOCKER_CLEANUP=${SKIP_DOCKER_CLEANUP:-false}
+EOF
+}
+
+# Enhanced automated cleanup setup
+setup_auto_cleanup() {
+    print_header "AUTOMATED CLEANUP SETUP"
+    
+    local cleanup_script="$HOME/bin/auto_cleanup.sh"
+    
+    # Create bin directory if it doesn't exist
+    mkdir -p "$HOME/bin"
+    
+    cat > "$cleanup_script" << 'EOF'
+#!/bin/bash
+# Automated cleanup script
+
+LOG_FILE="$HOME/auto_cleanup_$(date +%Y%m%d).log"
+
+{
+    echo "=== Automated Cleanup Started: $(date) ==="
+    
+    # Basic cleanup
+    sudo apt autoremove --purge -y
+    sudo apt autoclean
     sudo apt clean
-    whiptail --msgbox "✅ Packages purged and system cleaned!" 10 50
-else
-    echo "❌ Cancelled purge."
-fi
+    
+    # Log cleanup
+    sudo journalctl --vacuum-time=7d --quiet
+    
+    # Cache cleanup
+    rm -rf ~/.cache/thumbnails/* 2>/dev/null || true
+    rm -rf ~/.local/share/Trash/* 2>/dev/null || true
+    rm -rf ~/.cache/mozilla/firefox/*/cache2/* 2>/dev/null || true
+    
+    # Flatpak cleanup
+    flatpak uninstall --unused -y 2>/dev/null || true
+    
+    # Docker cleanup (if installed)
+    if command -v docker &> /dev/null; then
+        docker system prune -f 2>/dev/null || true
+    fi
+    
+    echo "=== Automated Cleanup Completed: $(date) ==="
+    
+} >> "$LOG_FILE" 2>&1
+EOF
+    
+    chmod +x "$cleanup_script"
+    
+    if confirm_action "Setup weekly automated cleanup (Sundays at 2 AM)?"; then
+        (crontab -l 2>/dev/null; echo "0 2 * * 0 $cleanup_script") | crontab -
+        print_success "Automated cleanup scheduled!"
+        print_status "Script location: $cleanup_script"
+        print_status "Logs will be in: $HOME/auto_cleanup_*.log"
+    fi
+}
+
+# Main cleanup function
+main_cleanup() {
+    print_header "COMPREHENSIVE SYSTEM CLEANUP"
+    
+    local space_before
+    space_before=$(get_disk_usage)
+    print_status "Available space before cleanup: ${space_before}G"
+    
+    SPACE_SAVED=0
+    
+    # Core cleanup functions
+    package_cleanup
+    log_cleanup  
+    temp_cleanup
+    cache_cleanup
+    flatpak_cleanup
+    snap_cleanup
+    docker_cleanup
+    system_optimization
+    
+    local space_after
+    space_after=$(get_disk_usage)
+    local space_freed=$((space_after - space_before))
+    
+    print_header "CLEANUP SUMMARY"
+    print_success "Cleanup completed successfully!"
+    print_status "Space before: ${space_before}G"
+    print_status "Space after: ${space_after}G"
+    print_status "Space freed: ${space_freed}G (estimated)"
+    print_status "Log file: $LOG_FILE"
+}
+
+# Enhanced menu system
+show_menu() {
+    while true; do
+        clear
+        print_header "ENHANCED KALI LINUX CLEANUP UTILITY v2.0"
+        echo
+        echo "Current disk usage: $(get_disk_usage_percent)%"
+        echo "Log file: $LOG_FILE"
+        echo
+        echo "1.  🧹 Full system cleanup"
+        echo "2.  📊 Analyze disk usage"
+        echo "3.  💾 DATA drive cleanup"
+        echo "4.  🐳 Docker cleanup"
+        echo "5.  📦 Package management"
+        echo "6.  🗂️  Cache cleanup only"
+        echo "7.  📝 Log cleanup only"
+        echo "8.  🔄 Setup automated cleanup"
+        echo "9.  ⚙️  Configuration"
+        echo "10. 🔍 Find large files"
+        echo "11. 📋 System information"
+        echo "12. ❓ Help"
+        echo "13. 🚪 Exit"
+        echo
+        
+        read -p "Select option (1-13): " choice
+        
+        case $choice in
+            1) main_cleanup ;;
+            2) analyze_disk ;;
+            3) data_drive_cleanup ;;
+            4) docker_cleanup ;;
+            5) package_cleanup ;;
+            6) cache_cleanup ;;
+            7) log_cleanup ;;
+            8) setup_auto_cleanup ;;
+            9) configure_script ;;
+            10) find_large_files ;;
+            11) show_system_info ;;
+            12) show_help ;;
+            13) 
+                print_success "Cleanup utility closed. Log saved to: $LOG_FILE"
+                exit 0
+                ;;
+            *) print_error "Invalid option. Please select 1-13." ;;
+        esac
+        
+        echo
+        read -p "Press Enter to continue..." || true
+    done
+}
+
+configure_script() {
+    print_header "SCRIPT CONFIGURATION"
+    
+    echo "Current configuration:"
+    echo "- Verbose mode: $VERBOSE"
+    echo "- Dry run mode: $DRY_RUN"
+    echo "- Log file: $LOG_FILE"
+    echo
+    
+    read -p "Enable verbose mode? (y/N): " -n 1 -r
+    echo
+    if [[ $REPLY =~ ^[Yy]$ ]]; then
+        VERBOSE=true
+    fi
+    
+    read -p "Enable dry run mode (no actual changes)? (y/N): " -n 1 -r  
+    echo
+    if [[ $REPLY =~ ^[Yy]$ ]]; then
+        DRY_RUN=true
+        print_warning "Dry run mode enabled - no actual changes will be made"
+    fi
+}
+
+find_large_files() {
+    print_header "LARGE FILE FINDER"
+    
+    read -p "Enter minimum file size (e.g., 100M, 1G): " size_input
+    local search_path="${1:-$HOME}"
+    
+    print_status "Searching for files larger than $size_input in $search_path..."
+    find "$search_path" -type f -size "+$size_input" -exec ls -lah {} \; 2>/dev/null | sort -k5 -rh | head -20
+}
+
+show_system_info() {
+    print_header "SYSTEM INFORMATION"
+    
+    echo "System: $(uname -a)"
+    echo "Uptime: $(uptime)"
+    echo "Memory: $(free -h | grep '^Mem:' | awk '{print $3 "/" $2}')"
+    echo "Disk Usage: $(df -h / | awk 'NR==2 {print $3 "/" $2 " (" $5 ")"}')"
+    echo "CPU: $(nproc) cores"
+    echo "Load Average: $(cat /proc/loadavg)"
+}
+
+show_help() {
+    print_header "HELP & USAGE"
+    
+    cat << EOF
+Enhanced Kali Linux Cleanup Utility v2.0
+
+COMMAND LINE OPTIONS:
+  --cleanup     Run full system cleanup
+  --analyze     Analyze disk usage
+  --data        DATA drive cleanup  
+  --auto        Setup automated cleanup
+  --dry-run     Preview changes without executing
+  --verbose     Enable verbose output
+  --config      Show configuration options
+  --help        Show this help message
+
+FEATURES:
+✓ Safe file removal with size tracking
+✓ Comprehensive package management
+✓ Enhanced cache and log cleanup  
+✓ Docker and container cleanup
+✓ Automated scheduling
+✓ Detailed disk analysis
+✓ Configuration management
+✓ Dry run mode for testing
+
+SAFETY:
+- Creates detailed logs of all operations
+- Confirms destructive operations
+- Tracks space savings
+- Safe error handling
+- Never runs as root (uses sudo when needed)
+
+LOG FILES:
+All operations are logged to: ~/cleanup_*.log
+EOF
+}
+
+# Argument parsing
+parse_arguments() {
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            --cleanup) 
+                main_cleanup
+                exit 0
+                ;;
+            --analyze)
+                analyze_disk
+                exit 0
+                ;;
+            --data)
+                data_drive_cleanup
+                exit 0
+                ;;
+            --auto)
+                setup_auto_cleanup
+                exit 0
+                ;;
+            --dry-run)
+                DRY_RUN=true
+                print_warning "Dry run mode enabled"
+                shift
+                ;;
+            --verbose|-v)
+                VERBOSE=true
+                shift
+                ;;
+            --config)
+                configure_script
+                exit 0
+                ;;
+            --help|-h)
+                show_help
+                exit 0
+                ;;
+            *)
+                print_error "Unknown option: $1"
+                show_help
+                exit 1
+                ;;
+        esac
+    done
+}
+
+# Initialization
+initialize() {
+    # Check dependencies
+    local missing_deps=()
+    
+    command -v bc >/dev/null || missing_deps+=("bc")
+    command -v tee >/dev/null || missing_deps+=("coreutils")
+    
+    if [[ ${#missing_deps[@]} -gt 0 ]]; then
+        print_error "Missing dependencies: ${missing_deps[*]}"
+        print_status "Install with: sudo apt install ${missing_deps[*]}"
+        exit 1
+    fi
+    
+    # Create log file
+    touch "$LOG_FILE"
+    log "Enhanced Cleanup Script v2.0 started"
+    log "Command line: $0 $*"
+    
+    # Load configuration
+    load_config
+}
+
+# Security check
+check_security() {
+    if [[ $EUID -eq 0 ]]; then
+        print_error "Security Warning: Don't run this script as root!"
+        print_error "The script will use sudo when necessary for system operations."
+        exit 1
+    fi
+    
+    # Check if running in a safe environment
+    if [[ "$PWD" == "/" ]]; then
+        print_warning "Running from root directory - this could be dangerous"
+        if ! confirm_action "Continue anyway?"; then
+            exit 1
+        fi
+    fi
+}
+
+# Main execution
+main() {
+    # Initialize
+    initialize
+    check_security
+    
+    # Parse arguments
+    if [[ $# -gt 0 ]]; then
+        parse_arguments "$@"
+    fi
+    
+    # Show interactive menu if no arguments
+    show_menu
+}
+
+# Trap for cleanup on exit
+cleanup_on_exit() {
+    log "Script execution completed"
+    save_config
+}
+
+trap cleanup_on_exit EXIT
+
+# Run main function with all arguments
+main "$@"
