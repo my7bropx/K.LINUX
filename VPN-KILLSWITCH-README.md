@@ -280,6 +280,52 @@ Logs are written to multiple locations:
 
 ## Troubleshooting
 
+### "Process Killed" Error (zsh: killed / bash: killed)
+
+If you see `zsh: killed` or `bash: killed` after OpenVPN connects successfully, this means the process was terminated by the system. **This is the most common issue!**
+
+**Quick Fix:**
+```bash
+# Run the automated fix script
+sudo ./fix-vpn-connection.sh
+```
+
+**Manual Fix:**
+```bash
+# 1. Stop any conflicting services
+sudo systemctl stop openvpn-killswitch
+sudo pkill -9 openvpn
+
+# 2. Clear killswitch firewall rules
+sudo iptables -P INPUT ACCEPT
+sudo iptables -P OUTPUT ACCEPT
+sudo iptables -P FORWARD ACCEPT
+sudo iptables -F
+
+# 3. Try again
+sudo openvpn --config /etc/openvpn/client.ovpn
+```
+
+**Diagnosis:**
+```bash
+# Run the troubleshooter to identify the issue
+sudo ./troubleshoot-vpn.sh
+```
+
+**Common Causes:**
+- **Killswitch service running**: If the `openvpn-killswitch` service is active, it may conflict with manual OpenVPN commands
+- **Firewall rules active**: Killswitch iptables rules may be blocking the connection
+- **OOM Killer**: System ran out of memory (check with `dmesg | grep -i oom`)
+- **Multiple instances**: Another OpenVPN process is already running
+
+**Recommended Approach:**
+Instead of running OpenVPN manually, use the killswitch service:
+```bash
+sudo systemctl start openvpn-killswitch
+sudo systemctl status openvpn-killswitch
+vpn-status.sh --watch
+```
+
 ### VPN Won't Connect
 
 1. Check OpenVPN configuration:
