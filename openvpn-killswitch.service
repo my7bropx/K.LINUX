@@ -1,0 +1,38 @@
+[Unit]
+Description=OpenVPN Killswitch Service
+Documentation=https://github.com/my7bropx/K.LINUX
+After=network-online.target
+Wants=network-online.target
+Before=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/openvpn-killswitch.sh start
+ExecStop=/usr/local/bin/openvpn-killswitch.sh stop
+ExecReload=/usr/local/bin/openvpn-killswitch.sh restart
+
+# Restart on failure
+Restart=on-failure
+RestartSec=10
+
+# Security settings
+PrivateTmp=true
+NoNewPrivileges=false
+ProtectSystem=false
+ProtectHome=false
+
+# Resource limits
+LimitNOFILE=65536
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=openvpn-killswitch
+
+# Process settings
+KillMode=mixed
+KillSignal=SIGTERM
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target
