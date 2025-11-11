@@ -22,12 +22,52 @@ AUTO_RECONNECT="${AUTO_RECONNECT:-true}"
 RECONNECT_DELAY="${RECONNECT_DELAY:-5}"
 CHECK_INTERVAL="${CHECK_INTERVAL:-10}"
 
+
+#Signal handling for allowed local network 
+
+trap_with_arg() {
+    local func="$1" ; shift
+    for sig ; do
+        trap "$func $sig" "$sig"
+    done
+}
+
+cleanup_and_exit() {
+    local signal="$1"
+    log_info "Received signal: $signal"
+    cleanup
+    exit 0
+}
+
+
+
+
+
 # Colors for output
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 NC='\033[0m' # No Color
+
+
+################################################################################
+# Error Handler
+################################################################################
+
+error_handler() {
+    local line_no=$1
+    local error_code=$2
+    log_error "Script failed at line $line_no with exit code $error_code"
+    cleanup
+    exit $error_code
+}
+
+trap_with_arg cleanup_and_exit SIGTERM SIGINT SIGHUP SIGQUIT
+trap 'log_info "SIGTERM received " ; cleanup; exit 0' SIGTERM
+trap 'error_handler ${LINENO} $?' ERR
+
+
 
 ################################################################################
 # Logging Functions
@@ -76,19 +116,7 @@ log_error() {
     echo -e "${RED}[ERROR]${NC} $*" >&2
 }
 
-################################################################################
-# Error Handler
-################################################################################
 
-error_handler() {
-    local line_no=$1
-    local error_code=$2
-    log_error "Script failed at line $line_no with exit code $error_code"
-    cleanup
-    exit $error_code
-}
-
-trap 'error_handler ${LINENO} $?' ERR
 
 ################################################################################
 # Configuration Loading
@@ -406,23 +434,39 @@ monitor_vpn() {
 ################################################################################
 
 cleanup() {
-    log_info "Cleaning up..."
-
-    stop_vpn
-
-    if [[ "$KILLSWITCH_ENABLED" == "true" ]]; then
-        disable_killswitch
+    log_info "Starting cleanup process..."
+    
+    # Save the return status of each operation
+    local stop_vpn_status=0
+    local disable_killswitch_status=0
+    local restore_dns_status=0
+    
+    if pgrep openvpn >/dev/null; then
+        stop_vpn || stop_vpn_status=$?
+        log_info "stop_vpn finished with status: $stop_vpn_status"
     fi
 
-    restore_dns
+    if [[ "$KILLSWITCH_ENABLED" == "true" ]]; then
+        disable_killswitch || disable_killswitch_status=$?
+        log_info "disable_killswitch finished with status: $disable_killswitch_status"
+    fi
 
-    rm -f "$PID_FILE" "$STATUS_FILE"
+    if [[ -f /etc/resolv.conf.backup ]]; then
+        restore_dns || restore_dns_status=$?
+        log_info "restore_dns finished with status: $restore_dns_status"
+    fi
 
-    log_info "Cleanup completed"
+    # Remove PID file if it exists and belongs to this process
+    if [[ -f "$PID_FILE" ]] && [[ "$(cat "$PID_FILE")" == "$$" ]]; then
+        rm -f "$PID_FILE"
+    fi
+
+    if [[ -f "$STATUS_FILE" ]]; then
+        rm -f "$STATUS_FILE"
+    fi
+
+    log_info "Cleanup completed with statuses: vpn=$stop_vpn_status, killswitch=$disable_killswitch_status, dns=$restore_dns_status"
 }
-
-trap cleanup EXIT INT TERM
-
 ################################################################################
 # Main Function
 ################################################################################
@@ -517,3 +561,4 @@ case "${1:-start}" in
         exit 1
         ;;
 esac
+
