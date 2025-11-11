@@ -24,7 +24,6 @@ Replace `<filename.sh>` with the actual script name.
 - Cleans package cache
 - Removes unused files
 - Frees up disk space
-- [Add any additional features your script provides]
 
 ## Requirements
 
