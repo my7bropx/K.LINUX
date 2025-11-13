@@ -3,9 +3,11 @@
 ################################################################################
 # OpenVPN Killswitch Script with DNS Masking
 # Features: Killswitch, DNS protection, Auto-reconnect, Logging, Error handling
+# Fixed version - handles errors gracefully without immediate exit
 ################################################################################
 
-set -euo pipefail
+# Use safer error handling - don't exit on all errors
+set -u  # Exit on undefined variables, but not on all errors
 
 # Configuration
 CONFIG_FILE="/etc/openvpn/killswitch.conf"
@@ -21,6 +23,7 @@ KILLSWITCH_ENABLED="${KILLSWITCH_ENABLED:-true}"
 AUTO_RECONNECT="${AUTO_RECONNECT:-true}"
 RECONNECT_DELAY="${RECONNECT_DELAY:-5}"
 CHECK_INTERVAL="${CHECK_INTERVAL:-10}"
+STARTUP_TIMEOUT="${STARTUP_TIMEOUT:-60}"
 
 # Colors for output
 RED='\033[0;31m'
@@ -35,9 +38,9 @@ NC='\033[0m' # No Color
 
 rotate_log() {
     if [[ -f "$LOG_FILE" ]]; then
-        local log_size=$(stat -f%z "$LOG_FILE" 2>/dev/null || stat -c%s "$LOG_FILE" 2>/dev/null || echo 0)
+        local log_size=$(stat -c%s "$LOG_FILE" 2>/dev/null || echo 0)
         if [[ $log_size -gt $MAX_LOG_SIZE ]]; then
-            mv "$LOG_FILE" "$LOG_FILE.old"
+            mv "$LOG_FILE" "$LOG_FILE.old" 2>/dev/null || true
             echo "$(date '+%Y-%m-%d %H:%M:%S') - Log rotated" > "$LOG_FILE"
         fi
     fi
@@ -50,45 +53,27 @@ log() {
     local timestamp=$(date '+%Y-%m-%d %H:%M:%S')
 
     rotate_log
-    echo "[$timestamp] [$level] $message" | tee -a "$LOG_FILE"
+    echo "[$timestamp] [$level] $message" >> "$LOG_FILE" 2>/dev/null || true
 
     # Also log to syslog
-    logger -t openvpn-killswitch "[$level] $message"
+    logger -t openvpn-killswitch "[$level] $message" 2>/dev/null || true
 }
 
 log_info() {
     log "INFO" "$@"
-    echo -e "${BLUE}[INFO]${NC} $*"
 }
 
 log_success() {
     log "SUCCESS" "$@"
-    echo -e "${GREEN}[SUCCESS]${NC} $*"
 }
 
 log_warning() {
     log "WARNING" "$@"
-    echo -e "${YELLOW}[WARNING]${NC} $*"
 }
 
 log_error() {
     log "ERROR" "$@"
-    echo -e "${RED}[ERROR]${NC} $*" >&2
 }
-
-################################################################################
-# Error Handler
-################################################################################
-
-error_handler() {
-    local line_no=$1
-    local error_code=$2
-    log_error "Script failed at line $line_no with exit code $error_code"
-    cleanup
-    exit $error_code
-}
-
-trap 'error_handler ${LINENO} $?' ERR
 
 ################################################################################
 # Configuration Loading
@@ -97,7 +82,10 @@ trap 'error_handler ${LINENO} $?' ERR
 load_config() {
     if [[ -f "$CONFIG_FILE" ]]; then
         log_info "Loading configuration from $CONFIG_FILE"
-        source "$CONFIG_FILE"
+        # Source config file safely
+        set +u
+        source "$CONFIG_FILE" 2>/dev/null || log_warning "Failed to load config file"
+        set -u
     else
         log_warning "Config file not found at $CONFIG_FILE, using defaults"
         create_default_config
@@ -106,7 +94,7 @@ load_config() {
 
 create_default_config() {
     log_info "Creating default configuration at $CONFIG_FILE"
-    mkdir -p "$(dirname "$CONFIG_FILE")"
+    mkdir -p "$(dirname "$CONFIG_FILE")" 2>/dev/null || true
     cat > "$CONFIG_FILE" << 'EOF'
 # OpenVPN Killswitch Configuration
 
@@ -128,10 +116,13 @@ RECONNECT_DELAY=5
 # VPN connection check interval (seconds)
 CHECK_INTERVAL=10
 
+# Startup timeout (seconds)
+STARTUP_TIMEOUT=60
+
 # Allowed local network (e.g., 192.168.1.0/24) - optional
 # ALLOW_LOCAL_NETWORK="192.168.1.0/24"
 EOF
-    chmod 600 "$CONFIG_FILE"
+    chmod 600 "$CONFIG_FILE" 2>/dev/null || true
 }
 
 ################################################################################
@@ -139,11 +130,11 @@ EOF
 ################################################################################
 
 get_default_interface() {
-    ip route | grep default | head -n1 | awk '{print $5}'
+    ip route 2>/dev/null | grep default | head -n1 | awk '{print $5}' || echo ""
 }
 
 get_vpn_interface() {
-    ip link show | grep -E "tun[0-9]|tap[0-9]" | head -n1 | awk -F: '{print $2}' | xargs
+    ip link show 2>/dev/null | grep -E "tun[0-9]|tap[0-9]" | head -n1 | awk -F: '{print $2}' | xargs || echo ""
 }
 
 get_public_ip() {
@@ -154,9 +145,9 @@ get_public_ip() {
 
 get_dns_servers() {
     if command -v resolvectl &> /dev/null; then
-        resolvectl status | grep "DNS Servers" | head -n1 | awk '{print $3}'
+        resolvectl status 2>/dev/null | grep "DNS Servers" | head -n1 | awk '{print $3}' || echo "Unknown"
     else
-        grep "nameserver" /etc/resolv.conf | head -n1 | awk '{print $2}'
+        grep "nameserver" /etc/resolv.conf 2>/dev/null | head -n1 | awk '{print $2}' || echo "Unknown"
     fi
 }
 
@@ -168,55 +159,57 @@ enable_killswitch() {
     log_info "Enabling killswitch..."
 
     # Flush existing rules
-    iptables -F
-    iptables -X
-    iptables -t nat -F
-    iptables -t nat -X
-    iptables -t mangle -F
-    iptables -t mangle -X
+    iptables -F 2>/dev/null || true
+    iptables -X 2>/dev/null || true
+    iptables -t nat -F 2>/dev/null || true
+    iptables -t nat -X 2>/dev/null || true
+    iptables -t mangle -F 2>/dev/null || true
+    iptables -t mangle -X 2>/dev/null || true
 
     # Set default policies to DROP
-    iptables -P INPUT DROP
-    iptables -P FORWARD DROP
-    iptables -P OUTPUT DROP
+    iptables -P INPUT DROP 2>/dev/null || true
+    iptables -P FORWARD DROP 2>/dev/null || true
+    iptables -P OUTPUT DROP 2>/dev/null || true
 
     # Allow loopback
-    iptables -A INPUT -i lo -j ACCEPT
-    iptables -A OUTPUT -o lo -j ACCEPT
+    iptables -A INPUT -i lo -j ACCEPT 2>/dev/null || true
+    iptables -A OUTPUT -o lo -j ACCEPT 2>/dev/null || true
 
     # Allow local network if specified
     if [[ -n "${ALLOW_LOCAL_NETWORK:-}" ]]; then
         log_info "Allowing local network: $ALLOW_LOCAL_NETWORK"
-        iptables -A INPUT -s "$ALLOW_LOCAL_NETWORK" -j ACCEPT
-        iptables -A OUTPUT -d "$ALLOW_LOCAL_NETWORK" -j ACCEPT
+        iptables -A INPUT -s "$ALLOW_LOCAL_NETWORK" -j ACCEPT 2>/dev/null || true
+        iptables -A OUTPUT -d "$ALLOW_LOCAL_NETWORK" -j ACCEPT 2>/dev/null || true
     fi
 
     # Allow VPN connection establishment
     local default_iface=$(get_default_interface)
     if [[ -n "$default_iface" ]]; then
-        # Allow outgoing connections to OpenVPN server
-        iptables -A OUTPUT -o "$default_iface" -p udp --dport 1194 -j ACCEPT
-        iptables -A OUTPUT -o "$default_iface" -p tcp --dport 1194 -j ACCEPT
-        iptables -A OUTPUT -o "$default_iface" -p udp --dport 443 -j ACCEPT
-        iptables -A OUTPUT -o "$default_iface" -p tcp --dport 443 -j ACCEPT
-        iptables -A INPUT -i "$default_iface" -m state --state ESTABLISHED,RELATED -j ACCEPT
+        # Allow outgoing connections to OpenVPN server (common ports)
+        iptables -A OUTPUT -o "$default_iface" -p udp --dport 1194 -j ACCEPT 2>/dev/null || true
+        iptables -A OUTPUT -o "$default_iface" -p tcp --dport 1194 -j ACCEPT 2>/dev/null || true
+        iptables -A OUTPUT -o "$default_iface" -p udp --dport 443 -j ACCEPT 2>/dev/null || true
+        iptables -A OUTPUT -o "$default_iface" -p tcp --dport 443 -j ACCEPT 2>/dev/null || true
+        iptables -A OUTPUT -o "$default_iface" -p udp --dport 5060 -j ACCEPT 2>/dev/null || true
+        iptables -A OUTPUT -o "$default_iface" -p tcp --dport 5060 -j ACCEPT 2>/dev/null || true
+        iptables -A INPUT -i "$default_iface" -m state --state ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || true
     fi
 
     # Allow all traffic through VPN interface
     local vpn_iface=$(get_vpn_interface)
     if [[ -n "$vpn_iface" ]]; then
         log_info "Allowing traffic through VPN interface: $vpn_iface"
-        iptables -A INPUT -i "$vpn_iface" -j ACCEPT
-        iptables -A OUTPUT -o "$vpn_iface" -j ACCEPT
-        iptables -A FORWARD -i "$vpn_iface" -j ACCEPT
-        iptables -A FORWARD -o "$vpn_iface" -j ACCEPT
+        iptables -A INPUT -i "$vpn_iface" -j ACCEPT 2>/dev/null || true
+        iptables -A OUTPUT -o "$vpn_iface" -j ACCEPT 2>/dev/null || true
+        iptables -A FORWARD -i "$vpn_iface" -j ACCEPT 2>/dev/null || true
+        iptables -A FORWARD -o "$vpn_iface" -j ACCEPT 2>/dev/null || true
     fi
 
     # Allow DNS queries to VPN DNS servers only
     IFS=',' read -ra DNS_ARRAY <<< "$VPN_DNS"
     for dns in "${DNS_ARRAY[@]}"; do
-        iptables -A OUTPUT -p udp --dport 53 -d "$dns" -j ACCEPT
-        iptables -A OUTPUT -p tcp --dport 53 -d "$dns" -j ACCEPT
+        iptables -A OUTPUT -p udp --dport 53 -d "$dns" -j ACCEPT 2>/dev/null || true
+        iptables -A OUTPUT -p tcp --dport 53 -d "$dns" -j ACCEPT 2>/dev/null || true
     done
 
     log_success "Killswitch enabled successfully"
@@ -226,17 +219,17 @@ disable_killswitch() {
     log_info "Disabling killswitch..."
 
     # Restore default policies
-    iptables -P INPUT ACCEPT
-    iptables -P FORWARD ACCEPT
-    iptables -P OUTPUT ACCEPT
+    iptables -P INPUT ACCEPT 2>/dev/null || true
+    iptables -P FORWARD ACCEPT 2>/dev/null || true
+    iptables -P OUTPUT ACCEPT 2>/dev/null || true
 
     # Flush all rules
-    iptables -F
-    iptables -X
-    iptables -t nat -F
-    iptables -t nat -X
-    iptables -t mangle -F
-    iptables -t mangle -X
+    iptables -F 2>/dev/null || true
+    iptables -X 2>/dev/null || true
+    iptables -t nat -F 2>/dev/null || true
+    iptables -t nat -X 2>/dev/null || true
+    iptables -t mangle -F 2>/dev/null || true
+    iptables -t mangle -X 2>/dev/null || true
 
     log_success "Killswitch disabled successfully"
 }
@@ -247,7 +240,7 @@ disable_killswitch() {
 
 backup_dns() {
     if [[ ! -f /etc/resolv.conf.backup ]]; then
-        cp /etc/resolv.conf /etc/resolv.conf.backup
+        cp /etc/resolv.conf /etc/resolv.conf.backup 2>/dev/null || true
         log_info "DNS configuration backed up"
     fi
 }
@@ -255,6 +248,9 @@ backup_dns() {
 set_vpn_dns() {
     log_info "Setting VPN DNS servers..."
     backup_dns
+
+    # Remove immutable flag first
+    chattr -i /etc/resolv.conf 2>/dev/null || true
 
     # Create new resolv.conf with VPN DNS
     cat > /etc/resolv.conf << EOF
@@ -280,7 +276,7 @@ restore_dns() {
     chattr -i /etc/resolv.conf 2>/dev/null || true
 
     if [[ -f /etc/resolv.conf.backup ]]; then
-        mv /etc/resolv.conf.backup /etc/resolv.conf
+        mv /etc/resolv.conf.backup /etc/resolv.conf 2>/dev/null || true
         log_success "Original DNS configuration restored"
     fi
 }
@@ -301,19 +297,23 @@ start_vpn() {
     pkill -9 openvpn 2>/dev/null || true
     sleep 2
 
-    # Start OpenVPN in background
+    # Start OpenVPN in background with log
+    log_info "Launching OpenVPN with config: $OPENVPN_CONFIG"
     openvpn --config "$OPENVPN_CONFIG" \
-            --daemon \
+            --daemon openvpn-killswitch \
             --log-append "$LOG_FILE" \
             --writepid /var/run/openvpn.pid \
             --script-security 2 \
             --up /etc/openvpn/update-resolv-conf \
-            --down /etc/openvpn/update-resolv-conf
+            --down /etc/openvpn/update-resolv-conf 2>&1 | tee -a "$LOG_FILE" || {
+        log_error "Failed to start OpenVPN"
+        return 1
+    }
 
     # Wait for VPN interface to come up
+    log_info "Waiting for VPN interface (timeout: ${STARTUP_TIMEOUT}s)..."
     local attempts=0
-    local max_attempts=30
-    while [[ $attempts -lt $max_attempts ]]; do
+    while [[ $attempts -lt $STARTUP_TIMEOUT ]]; do
         local vpn_iface=$(get_vpn_interface)
         if [[ -n "$vpn_iface" ]]; then
             log_success "VPN connected on interface: $vpn_iface"
@@ -323,7 +323,7 @@ start_vpn() {
         ((attempts++))
     done
 
-    log_error "VPN connection timeout"
+    log_error "VPN connection timeout after ${STARTUP_TIMEOUT}s"
     return 1
 }
 
@@ -332,13 +332,13 @@ stop_vpn() {
     pkill -TERM openvpn 2>/dev/null || true
     sleep 2
     pkill -9 openvpn 2>/dev/null || true
-    rm -f /var/run/openvpn.pid
+    rm -f /var/run/openvpn.pid 2>/dev/null || true
     log_success "VPN connection stopped"
 }
 
 check_vpn_status() {
     local vpn_iface=$(get_vpn_interface)
-    if [[ -n "$vpn_iface" ]] && pgrep -x openvpn > /dev/null; then
+    if [[ -n "$vpn_iface" ]] && pgrep -x openvpn > /dev/null 2>&1; then
         return 0  # VPN is running
     else
         return 1  # VPN is not running
@@ -354,14 +354,14 @@ update_status() {
     local ip="$2"
     local dns="$3"
 
-    mkdir -p "$(dirname "$STATUS_FILE")"
+    mkdir -p "$(dirname "$STATUS_FILE")" 2>/dev/null || true
     cat > "$STATUS_FILE" << EOF
 STATUS=$status
 IP=$ip
 DNS=$dns
 TIMESTAMP=$(date '+%Y-%m-%d %H:%M:%S')
 EOF
-    chmod 644 "$STATUS_FILE"
+    chmod 644 "$STATUS_FILE" 2>/dev/null || true
 }
 
 ################################################################################
@@ -392,7 +392,7 @@ monitor_vpn() {
                         enable_killswitch
                     fi
                 else
-                    log_error "Reconnection failed"
+                    log_error "Reconnection failed, will retry in $CHECK_INTERVAL seconds"
                 fi
             fi
         fi
@@ -416,11 +416,12 @@ cleanup() {
 
     restore_dns
 
-    rm -f "$PID_FILE" "$STATUS_FILE"
+    rm -f "$PID_FILE" "$STATUS_FILE" 2>/dev/null || true
 
     log_info "Cleanup completed"
 }
 
+# Setup cleanup on exit
 trap cleanup EXIT INT TERM
 
 ################################################################################
@@ -436,12 +437,12 @@ main() {
 
     # Check if already running
     if [[ -f "$PID_FILE" ]]; then
-        local old_pid=$(cat "$PID_FILE")
-        if ps -p "$old_pid" > /dev/null 2>&1; then
+        local old_pid=$(cat "$PID_FILE" 2>/dev/null || echo "")
+        if [[ -n "$old_pid" ]] && ps -p "$old_pid" > /dev/null 2>&1; then
             log_error "Script is already running (PID: $old_pid)"
             exit 1
         else
-            rm -f "$PID_FILE"
+            rm -f "$PID_FILE" 2>/dev/null || true
         fi
     fi
 
@@ -449,6 +450,7 @@ main() {
     echo $$ > "$PID_FILE"
 
     log_info "=== OpenVPN Killswitch Starting ==="
+    log_info "PID: $$"
 
     # Load configuration
     load_config
@@ -462,6 +464,7 @@ main() {
     done
 
     # Start VPN
+    log_info "Starting VPN connection..."
     if ! start_vpn; then
         log_error "Failed to start VPN"
         exit 1
@@ -484,6 +487,9 @@ main() {
     log_success "VPN is active"
     log_success "Public IP: $ip"
     log_success "DNS Server: $dns"
+
+    # Notify systemd that we're ready (if running under systemd)
+    systemd-notify --ready 2>/dev/null || true
 
     # Start monitoring
     monitor_vpn

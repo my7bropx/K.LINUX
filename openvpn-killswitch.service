@@ -6,14 +6,22 @@ Wants=network-online.target
 Before=network.target
 
 [Service]
-Type=simple
+Type=notify
+NotifyAccess=main
+
+# Execution
 ExecStart=/usr/local/bin/openvpn-killswitch.sh start
 ExecStop=/usr/local/bin/openvpn-killswitch.sh stop
 ExecReload=/usr/local/bin/openvpn-killswitch.sh restart
 
-# Restart on failure
+# Restart behavior
 Restart=on-failure
-RestartSec=10
+RestartSec=15
+
+# Timeouts - increased to allow VPN to connect
+TimeoutStartSec=120
+TimeoutStopSec=30
+TimeoutSec=0
 
 # Security settings
 PrivateTmp=true
@@ -32,7 +40,11 @@ SyslogIdentifier=openvpn-killswitch
 # Process settings
 KillMode=mixed
 KillSignal=SIGTERM
-TimeoutStopSec=30
+SendSIGKILL=yes
+FinalKillSignal=SIGKILL
+
+# Environment
+Environment="PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 
 [Install]
 WantedBy=multi-user.target
